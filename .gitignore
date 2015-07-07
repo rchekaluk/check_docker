@@ -2,3 +2,6 @@
 *.swp
 check_docker
 .vagrant
+pkg
+src
+
