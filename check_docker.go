@@ -4,315 +4,448 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"io/ioutil"
-	"net/http"
-	"strconv"
+	"fmt"
+	dockerlib "github.com/fsouza/go-dockerclient"
+	"github.com/newrelic/go_nagios"
+	"github.com/shenwei356/util/bytesize"
 	"strings"
 	"sync"
-
-	"github.com/newrelic/go_nagios"
+	"time"
 )
 
-const (
-	API_VERSION = "v1.10"
-)
+func NewCheckDocker(endpoint string) (*CheckDocker, error) {
+	var err error
 
-// A struct representing CLI opts that will be passed at runtime
-type CliOpts struct {
-	BaseUrl       string
-	CritDataSpace int
-	WarnDataSpace int
-	CritMetaSpace int
-	WarnMetaSpace int
-	ImageId       string
-	GhostsStatus  int
-}
+	cd := &CheckDocker{}
+	cd.WarnMetaSpace = 100 // defaults
+	cd.CritMetaSpace = 100
+	cd.WarnDataSpace = 100
+	cd.CritDataSpace = 100
+	cd.CheckRestartCount = false
+	cd.WarnRestartCount = 1
+	cd.CritRestartCount = 2
+	cd.CheckUptime = false
+	cd.WarnUptimeSecs = 3600
+	cd.CritUptimeSecs = 1200
 
-// Information describing the status of a Docker host
-type DockerInfo struct {
-	Containers     float64
-	Driver         string
-	DriverStatus   [][]string
-	DataSpaceUsed  float64
-	DataSpaceTotal float64
-	MetaSpaceUsed  float64
-	MetaSpaceTotal float64
-	ImageIsRunning bool
-	GhostCount     int
-}
-
-// Used internally to build lists of checks to run
-type checkArgs struct {
-	tag                string
-	value              string
-	healthy            bool
-	appendErrorMessage string
-	statusVal          nagios.NagiosStatusVal
-}
-
-// Describes one container
-type Container struct {
-	Image  string
-	Status string
-}
-
-// An interface to request things from the Web
-type HttpResponseFetcher interface {
-	Fetch(url string) ([]byte, error)
-}
-
-type Fetcher struct{}
-
-// Properly format a Float64 as a string
-func float64String(num float64) string {
-	return strconv.FormatFloat(num, 'f', 0, 64)
-}
-
-// Return a float from a Docker info string for megabytes
-func megabytesFloat64(value string) (float64, error) {
-	numberStr := strings.Fields(value)[0]
-	number, err := strconv.ParseFloat(numberStr, 64)
-
-	if err != nil {
-		return 0.00, err
+	if endpoint != "" {
+		err = cd.setupClient(endpoint)
 	}
 
-	return number, nil
+	return cd, err
 }
 
-// Look through a list of driveStatus slices and find the one that matches
-func findDriverStatus(key string, driverStatus [][]string) string {
-	for _, entry := range driverStatus {
-		if entry[0] == key {
-			return entry[1]
+type CheckDocker struct {
+	WarnMetaSpace        float64
+	CritMetaSpace        float64
+	WarnDataSpace        float64
+	CritDataSpace        float64
+	CheckRestartCount    bool
+	WarnRestartCount     int
+	CritRestartCount     int
+	CheckUptime          bool
+	WarnUptimeSecs       int64
+	CritUptimeSecs       int64
+	ImageId              string
+	ContainerName        string
+	TLSCertPath          string
+	TLSKeyPath           string
+	TLSCAPath            string
+	dockerclient         *dockerlib.Client
+	dockerInfoData       *dockerlib.Env
+	dockerContainersData []dockerlib.APIContainers
+}
+
+func (cd *CheckDocker) setupClient(endpoint string) error {
+	var err error
+
+	if cd.TLSCertPath != "" && cd.TLSKeyPath != "" && cd.TLSCAPath != "" {
+		cd.dockerclient, err = dockerlib.NewTLSClient(endpoint, cd.TLSCertPath, cd.TLSKeyPath, cd.TLSCAPath)
+	} else {
+		cd.dockerclient, err = dockerlib.NewClient(endpoint)
+	}
+
+	return err
+}
+
+func (cd *CheckDocker) GetData() error {
+	errChan := make(chan error)
+	var err error
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	go func(cd *CheckDocker, errChan chan error) {
+		defer wg.Done()
+
+		cd.dockerInfoData, err = cd.dockerclient.Info()
+		if err != nil {
+			errChan <- err
+		}
+	}(cd, errChan)
+
+	go func(cd *CheckDocker, errChan chan error) {
+		defer wg.Done()
+
+		cd.dockerContainersData, err = cd.dockerclient.ListContainers(dockerlib.ListContainersOptions{})
+		if err != nil {
+			errChan <- err
+		}
+	}(cd, errChan)
+
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	err = <-errChan
+
+	return err
+}
+
+func (cd *CheckDocker) getByteSizeDriverStatus(key string) (bytesize.ByteSize, error) {
+	var statusInArray [][]string
+
+	err := json.Unmarshal([]byte(cd.dockerInfoData.Get("DriverStatus")), &statusInArray)
+
+	if err != nil {
+		return -1, errors.New("Unable to extract DriverStatus info.")
+	}
+
+	for _, status := range statusInArray {
+		if status[0] == key {
+			return bytesize.Parse([]byte(status[1]))
 		}
 	}
 
-	return ""
+	return -1, errors.New(fmt.Sprintf("DriverStatus does not contain \"%v\"", key))
 }
 
-// Connect to a Docker URL and return the contents as a []byte
-func (Fetcher) Fetch(url string) ([]byte, error) {
-	response, err := http.Get(url)
-
-	if err != nil {
-		return nil, err
-	}
-
-	defer response.Body.Close()
-
-	contents, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	return contents, nil
+func (cd *CheckDocker) GetDataSpaceUsed() (bytesize.ByteSize, error) {
+	return cd.getByteSizeDriverStatus("Data Space Used")
 }
 
-// Parses JSON and populates a DockerInfo
-func populateInfo(contents []byte, info *DockerInfo) error {
-	err := json.Unmarshal(contents, info)
-	if err != nil {
-		return err
-	}
+func (cd *CheckDocker) GetDataSpaceTotal() (bytesize.ByteSize, error) {
+	return cd.getByteSizeDriverStatus("Data Space Total")
+}
 
-	fields := map[string]*float64{
-		"Data Space Used":      &info.DataSpaceUsed,
-		"Data Space Total":     &info.DataSpaceTotal,
-		"Metadata Space Used":  &info.MetaSpaceUsed,
-		"Metadata Space Total": &info.MetaSpaceTotal,
-	}
+func (cd *CheckDocker) GetMetaSpaceUsed() (bytesize.ByteSize, error) {
+	return cd.getByteSizeDriverStatus("Metadata Space Used")
+}
 
-	for key, val := range fields {
-		entry := findDriverStatus(key, info.DriverStatus)
-		if entry != "" {
-			*val, err = megabytesFloat64(findDriverStatus(key, info.DriverStatus))
-			if err != nil {
-				return errors.New("Error parsing response from API! " + err.Error())
+func (cd *CheckDocker) GetMetaSpaceTotal() (bytesize.ByteSize, error) {
+	return cd.getByteSizeDriverStatus("Metadata Space Total")
+}
+
+func (cd *CheckDocker) IsContainerRunning(imageId string) (dockerlib.APIContainers, bool) {
+	for _, container := range cd.dockerContainersData {
+		if strings.HasPrefix(container.Image, imageId) && strings.HasPrefix(container.Status, "Up") {
+			return container, true
+		}
+	}
+	return dockerlib.APIContainers{}, false
+}
+
+func (cd *CheckDocker) IsNamedContainerRunning(containerName string) (dockerlib.APIContainers, bool) {
+	for _, container := range cd.dockerContainersData {
+		for _, name := range container.Names {
+			// Container names start with a slash for some reason, maybe a bug?
+			// Remove the leading / only if it's found so this doesn't break in
+			// the future.
+			if strings.HasPrefix(name, "/") {
+				name = name[1:]
+			}
+			if name == containerName {
+				if strings.HasPrefix(container.Status, "Up") {
+					return container, true
+				} else {
+					return dockerlib.APIContainers{}, false
+				}
 			}
 		}
 	}
-
-	return nil
+	return dockerlib.APIContainers{}, false
 }
 
-// checkRunningContainers looks to see if a container is currently running from a given
-// Image Id.
-func checkRunningContainers(contents []byte, opts *CliOpts) (bool, int, error) {
-	var containers []Container
+func (cd* CheckDocker) GetContainerDetailsImageId(imageId string) (*dockerlib.Container, bool) {
+	for _, container := range cd.dockerContainersData {
+	  if container.ID == imageId {
+			containerInfo, err := cd.dockerclient.InspectContainer(imageId)
+			if err != nil {
+			  return nil, false
+			} else {
+			  return containerInfo, true
+			}
+		}
+	}
+	return nil, false
+}
 
-	err := json.Unmarshal(contents, &containers)
+func (cd* CheckDocker) GetContainerDetailsNamed(containerName string) (*dockerlib.Container, bool) {
+	for _, container := range cd.dockerContainersData {
+	  for _, name := range container.Names {
+			// Container names start with a slash for some reason, maybe a bug?
+			// Remove the leading / only if it's found so this doesn't break in
+			// the future.
+			if strings.HasPrefix(name, "/") {
+				name = name[1:]
+			}
+			if name == containerName {
+				containerInfo, err := cd.dockerclient.InspectContainer(containerName)
+				if err != nil {
+				  return nil, false
+				} else {
+				  return containerInfo, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+func (cd *CheckDocker) IsContainerAGhost(imageId string) (dockerlib.APIContainers, bool) {
+	for _, container := range cd.dockerContainersData {
+		if strings.HasPrefix(container.Image, imageId) && strings.Contains(container.Status, "Ghost") {
+			return container, true
+		}
+	}
+	return dockerlib.APIContainers{}, false
+}
+
+func (cd *CheckDocker) CheckMetaSpace(warnThreshold, criticalThreshold float64) *nagios.NagiosStatus {
+	usedByteSize, err := cd.GetMetaSpaceUsed()
 	if err != nil {
-		return false, 0, err
+		return &nagios.NagiosStatus{err.Error(), nagios.NAGIOS_CRITICAL}
 	}
 
-	isRunning := false
-	ghostCount := 0
-	for _, container := range containers {
-		if strings.HasPrefix(container.Image, opts.ImageId+":") && strings.HasPrefix(container.Status, "Up") {
-			isRunning = true
-		} else if strings.Contains(container.Status, "Ghost") {
-			ghostCount += 1
-		}
-	}
-	return isRunning, ghostCount, nil
-}
-
-// fetchInfo retrieves JSON from a Docker host and fills in a DockerInfo
-func fetchInfo(fetcher HttpResponseFetcher, opts CliOpts, info *DockerInfo) error {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	var err, err2 error
-	var imageFound bool
-	var ghostCount int
-
-	// `info` is handled by this goroutine but not the other
-	go func() {
-		var infoResult []byte
-		infoResult, err = fetcher.Fetch(opts.BaseUrl + "/" + API_VERSION + "/info")
-		if err == nil {
-			err = populateInfo(infoResult, info)
-		}
-		wg.Done()
-	}()
-
-	go func() {
-		var containersResult []byte
-		containersResult, err2 = fetcher.Fetch(opts.BaseUrl + "/" + API_VERSION + "/containers/json")
-		if err2 == nil {
-			imageFound, ghostCount, err2 = checkRunningContainers(containersResult, &opts)
-		}
-		wg.Done()
-	}()
-
-	wg.Wait()
-
+	totalByteSize, err := cd.GetMetaSpaceTotal()
 	if err != nil {
-		return err
+		return &nagios.NagiosStatus{err.Error(), nagios.NAGIOS_CRITICAL}
 	}
 
-	if err2 != nil {
-		return err2
+	percentUsed := float64(usedByteSize/totalByteSize) * 100
+
+	status := &nagios.NagiosStatus{fmt.Sprintf("Metadata Space Usage: %f", percentUsed) + "%", nagios.NAGIOS_OK}
+
+	if percentUsed >= warnThreshold {
+		status.Value = nagios.NAGIOS_WARNING
+	}
+	if percentUsed >= criticalThreshold {
+		status.Value = nagios.NAGIOS_CRITICAL
 	}
 
-	info.ImageIsRunning = imageFound
-	info.GhostCount = ghostCount
-
-	return nil
+	return status
 }
 
-// defineChecks returns a list of checks we should run based on CLI flags
-func defineChecks(info *DockerInfo, opts *CliOpts) []checkArgs {
-	checks := make([]checkArgs, 0)
-
-	if info.Driver == "devicemapper" {
-		checks = append(checks,
-			checkArgs{"Meta Space Used",
-				float64String(info.MetaSpaceUsed / info.MetaSpaceTotal * 100),
-				info.MetaSpaceUsed/info.MetaSpaceTotal*100 < float64(opts.CritMetaSpace),
-				"%",
-				nagios.NAGIOS_CRITICAL,
-			},
-			checkArgs{"Data Space Used",
-				float64String(info.DataSpaceUsed / info.DataSpaceTotal * 100),
-				info.DataSpaceUsed/info.DataSpaceTotal*100 < float64(opts.CritDataSpace),
-				"%",
-				nagios.NAGIOS_CRITICAL,
-			},
-			checkArgs{"Meta Space Used",
-				float64String(info.MetaSpaceUsed / info.MetaSpaceTotal * 100),
-				info.MetaSpaceUsed/info.MetaSpaceTotal*100 < float64(opts.WarnMetaSpace),
-				"%",
-				nagios.NAGIOS_WARNING,
-			},
-			checkArgs{"Data Space Used",
-				float64String(info.DataSpaceUsed / info.DataSpaceTotal * 100),
-				info.DataSpaceUsed/info.DataSpaceTotal*100 < float64(opts.WarnDataSpace),
-				"%",
-				nagios.NAGIOS_WARNING,
-			},
-			checkArgs{"Ghost Containers",
-				strconv.Itoa(info.GhostCount),
-				info.GhostCount == 0,
-				"",
-				nagios.NagiosStatusVal(opts.GhostsStatus),
-			},
-		)
+func (cd *CheckDocker) CheckDataSpace(warnThreshold, criticalThreshold float64) *nagios.NagiosStatus {
+	usedByteSize, err := cd.GetDataSpaceUsed()
+	if err != nil {
+		return &nagios.NagiosStatus{err.Error(), nagios.NAGIOS_CRITICAL}
 	}
 
-	if opts.ImageId != "" {
-		checks = append(checks,
-			checkArgs{"Running Image",
-				opts.ImageId,
-				info.ImageIsRunning,
-				" is not running!",
-				nagios.NAGIOS_CRITICAL,
-			},
-		)
+	totalByteSize, err := cd.GetDataSpaceTotal()
+	if err != nil {
+		return &nagios.NagiosStatus{err.Error(), nagios.NAGIOS_CRITICAL}
 	}
 
-	return checks
+	percentUsed := float64(usedByteSize/totalByteSize) * 100
+
+	status := &nagios.NagiosStatus{fmt.Sprintf("Data Space Usage: %f", percentUsed) + "%", nagios.NAGIOS_OK}
+
+	if percentUsed >= warnThreshold {
+		status.Value = nagios.NAGIOS_WARNING
+	}
+	if percentUsed >= criticalThreshold {
+		status.Value = nagios.NAGIOS_CRITICAL
+	}
+
+	return status
 }
 
-// Runs a set of checkes and returns an array of statuses
-func mapAlertStatuses(info *DockerInfo, opts *CliOpts) []*nagios.NagiosStatus {
-	var statuses []*nagios.NagiosStatus
+func (cd *CheckDocker) CheckImageContainerStatus(imageId string) *nagios.NagiosStatus {
+	container, isRunning := cd.IsContainerRunning(imageId)
+	containerGhost, isGhost := cd.IsContainerAGhost(imageId)
 
-	var check = func(args checkArgs) *nagios.NagiosStatus {
-		if !args.healthy {
-			return &nagios.NagiosStatus{args.tag + ": " + args.value + args.appendErrorMessage, args.statusVal}
+	if !isRunning {
+		return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) is not running.", imageId), nagios.NAGIOS_CRITICAL}
+	}
+	if isGhost {
+		return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) of image: %v is in ghost state.", containerGhost.ID, imageId), nagios.NAGIOS_CRITICAL}
+	}
+	if isRunning && !isGhost {
+    return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) of image: %v is working as expected.", container.ID, imageId), nagios.NAGIOS_OK}
+	}
+	return &nagios.NagiosStatus{fmt.Sprintf("Container of image: %v - status unknown.", imageId), nagios.NAGIOS_CRITICAL}
+}
+
+func (cd *CheckDocker) CheckNamedContainerStatus(containerName string) *nagios.NagiosStatus {
+	container, isRunning := cd.IsNamedContainerRunning(containerName)
+	_, isGhost := cd.IsContainerAGhost(container.ID)
+
+	if !isRunning {
+		return &nagios.NagiosStatus{fmt.Sprintf("Container named: %v is not running.", containerName), nagios.NAGIOS_CRITICAL}
+	}
+	if isGhost {
+		return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v is in ghost state.", container.ID, containerName), nagios.NAGIOS_CRITICAL}
+	}
+	if isRunning && !isGhost {
+		return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v is working as expected.", container.ID, containerName), nagios.NAGIOS_OK}
+	}
+	return &nagios.NagiosStatus{fmt.Sprintf("Container named: %v - status unknown.", containerName), nagios.NAGIOS_CRITICAL}
+}
+
+
+func (cd *CheckDocker) CheckImageContainerRestartCount(imageId string) *nagios.NagiosStatus {
+	container, isRunning := cd.IsContainerRunning(imageId)
+	containerGhost, isGhost := cd.IsContainerAGhost(imageId)
+
+	if isRunning && !isGhost {
+		containerDetails, success := cd.GetContainerDetailsImageId(imageId)
+		if success {
+			if containerDetails.RestartCount > cd.CritRestartCount {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) has been restarted %d times.", container.ID, containerDetails.RestartCount), nagios.NAGIOS_CRITICAL}
+			} else if containerDetails.RestartCount > cd.WarnRestartCount {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) has been restarted %d times.", containerGhost.ID, containerDetails.RestartCount), nagios.NAGIOS_WARNING}
+			} else {
+        return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) of image: %v has an acceptable RestartCount of %d", container.ID, imageId, containerDetails.RestartCount), nagios.NAGIOS_OK}
+			}
 		}
-		return nil
 	}
-
-	checks := defineChecks(info, opts)
-
-	for _, entry := range checks {
-		result := check(entry)
-		if result != nil {
-			statuses = append(statuses, check(entry))
-		}
-	}
-
-	return statuses
+	return &nagios.NagiosStatus{fmt.Sprintf("Container of image: %v - status unknown.", imageId), nagios.NAGIOS_CRITICAL}
 }
 
-// parseCommandLine parses the flags passed on the CLI
-func parseCommandLine() *CliOpts {
-	var opts CliOpts
+func (cd *CheckDocker) CheckNamedContainerRestartCount(containerName string) *nagios.NagiosStatus {
+	container, isRunning := cd.IsNamedContainerRunning(containerName)
+	_, isGhost := cd.IsContainerAGhost(container.ID)
 
-	flag.StringVar(&opts.BaseUrl, "base-url", "", "The Base URL for the Docker server")
-	flag.IntVar(&opts.WarnMetaSpace, "warn-meta-space", 100, "Warning threshold for Metadata Space")
-	flag.IntVar(&opts.WarnDataSpace, "warn-data-space", 100, "Warning threshold for Data Space")
-	flag.IntVar(&opts.CritMetaSpace, "crit-meta-space", 100, "Critical threshold for Metadata Space")
-	flag.IntVar(&opts.CritDataSpace, "crit-data-space", 100, "Critical threshold for Data Space")
-	flag.StringVar(&opts.ImageId, "image-id", "", "An image ID that must be running on the Docker server")
-	flag.IntVar(&opts.GhostsStatus, "ghosts-status", 1, "If ghosts are present, treat as this status")
+	if isRunning && !isGhost {
+		containerDetails, success := cd.GetContainerDetailsNamed(containerName)
+		if success {
+			if containerDetails.RestartCount > cd.CritRestartCount {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v has been restarted %d times.", container.ID, containerName, containerDetails.RestartCount), nagios.NAGIOS_CRITICAL}
+			} else if containerDetails.RestartCount > cd.WarnRestartCount {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v has been restarted %d times.", container.ID, containerName, containerDetails.RestartCount), nagios.NAGIOS_WARNING}
+			} else {
+				return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v has an acceptable RestartCount of %d.", container.ID, containerName, containerDetails.RestartCount), nagios.NAGIOS_OK}
+			}
+		}
+	}
+	return &nagios.NagiosStatus{fmt.Sprintf("Container named: %v - status unknown.", containerName), nagios.NAGIOS_CRITICAL}
+}
 
-	flag.Parse()
+func (cd *CheckDocker) CheckImageContainerUptime(imageId string) *nagios.NagiosStatus {
+	container, isRunning := cd.IsContainerRunning(imageId)
+	containerGhost, isGhost := cd.IsContainerAGhost(imageId)
 
-	return &opts
+	if isRunning && !isGhost {
+		containerDetails, success := cd.GetContainerDetailsImageId(imageId)
+		if success {
+			var now = time.Now().Unix()
+			var started = containerDetails.State.StartedAt.Unix()
+			var duration = (now - started)
+			if duration < cd.CritUptimeSecs {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) has an uptime of %d (<%d critical threshold).", container.ID, duration, cd.CritUptimeSecs), nagios.NAGIOS_CRITICAL}
+			} else if duration < cd.WarnUptimeSecs {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) has an uptime of %d (<%d warning threshold).", containerGhost.ID, duration, cd.WarnUptimeSecs), nagios.NAGIOS_WARNING}
+			} else {
+        return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) of image: %v has been up since %s.", container.ID, imageId, containerDetails.State.StartedAt), nagios.NAGIOS_OK}
+			}
+		}
+	}
+	return &nagios.NagiosStatus{fmt.Sprintf("Container of image: %v - status unknown.", imageId), nagios.NAGIOS_CRITICAL}
+}
+
+func (cd *CheckDocker) CheckNamedContainerUptime(containerName string) *nagios.NagiosStatus {
+	container, isRunning := cd.IsNamedContainerRunning(containerName)
+	_, isGhost := cd.IsContainerAGhost(container.ID)
+
+	if isRunning && !isGhost {
+		containerDetails, success := cd.GetContainerDetailsNamed(containerName)
+		if success {
+			var now = time.Now().Unix()
+			var started = containerDetails.State.StartedAt.Unix()
+			var duration = (now - started)
+			if duration < cd.CritUptimeSecs {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v has an uptime of %d (<%d critical threshold).", container.ID, containerName, duration, cd.CritUptimeSecs), nagios.NAGIOS_CRITICAL}
+			} else if duration < cd.WarnUptimeSecs {
+			  return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v has an uptime of %d (<%d warning threshold).", container.ID, containerName, duration, cd.WarnUptimeSecs), nagios.NAGIOS_WARNING}
+			} else {
+				return &nagios.NagiosStatus{fmt.Sprintf("Container(ID: %v) named: %v has been up since %s.", container.ID, containerName, containerDetails.State.StartedAt), nagios.NAGIOS_OK}
+			}
+		}
+	}
+	return &nagios.NagiosStatus{fmt.Sprintf("Container named: %v - status unknown.", containerName), nagios.NAGIOS_CRITICAL}
 }
 
 func main() {
-	opts := parseCommandLine()
-
-	if opts.BaseUrl == "" {
-		nagios.Critical(errors.New("-base-url must be supplied"))
-	}
-
-	var fetcher Fetcher
-	var info DockerInfo
-
-	err := fetchInfo(fetcher, *opts, &info)
+	cd, err := NewCheckDocker("")
 	if err != nil {
 		nagios.Critical(err)
 	}
 
-	statuses := mapAlertStatuses(&info, opts)
-	baseStatus := nagios.NagiosStatus{float64String(info.Containers) + " containers", 0}
+	var dockerEndpoint string
 
-	baseStatus.Aggregate(statuses)
-	nagios.ExitWithStatus(&baseStatus)
+	flag.StringVar(&dockerEndpoint, "base-url", "http://localhost:2375", "The Base URL for the Docker server")
+	flag.Float64Var(&cd.WarnMetaSpace, "warn-meta-space", 100, "Warning threshold for Metadata Space")
+	flag.Float64Var(&cd.CritMetaSpace, "crit-meta-space", 100, "Critical threshold for Metadata Space")
+	flag.Float64Var(&cd.WarnDataSpace, "warn-data-space", 100, "Warning threshold for Data Space")
+	flag.Float64Var(&cd.CritDataSpace, "crit-data-space", 100, "Critical threshold for Data Space")
+	flag.BoolVar(&cd.CheckRestartCount, "check-restart", false, "Check the number of automated container restarts for the specified container")
+	flag.IntVar(&cd.WarnRestartCount, "warn-restart-count", 1, "Warning threshold for automated restarts")
+	flag.IntVar(&cd.CritRestartCount, "crit-restart-count", 2, "Critical threshold for automated restarts")
+	flag.BoolVar(&cd.CheckUptime, "check-uptime", false, "Check the expected uptime of the specified container")
+	flag.Int64Var(&cd.WarnUptimeSecs, "warn-uptime-secs", 3600, "Warning threshold for uptime")
+	flag.Int64Var(&cd.CritUptimeSecs, "crit-uptime-secs", 1200, "Critical threshold for uptime")
+	flag.StringVar(&cd.ImageId, "image-id", "", "An image ID that must be running on the Docker server")
+	flag.StringVar(&cd.ContainerName, "container-name", "", "The name of a container that must be running on the Docker server")
+	flag.StringVar(&cd.TLSCertPath, "tls-cert", "", "Path to TLS cert file.")
+	flag.StringVar(&cd.TLSKeyPath, "tls-key", "", "Path to TLS key file.")
+	flag.StringVar(&cd.TLSCAPath, "tls-ca", "", "Path to TLS CA file.")
+
+	flag.Parse()
+
+	err = cd.setupClient(dockerEndpoint)
+	if err != nil {
+		nagios.Critical(err)
+	}
+
+	err = cd.GetData()
+	if err != nil {
+		nagios.Critical(err)
+	}
+
+	baseStatus := &nagios.NagiosStatus{fmt.Sprintf("Total Containers: %v", len(cd.dockerContainersData)), nagios.NAGIOS_OK}
+
+	statuses := make([]*nagios.NagiosStatus, 0)
+
+	driver := cd.dockerInfoData.Get("Driver")
+
+	// Unfortunately, Metadata Space and Data Space information is only available on devicemapper
+	if driver == "devicemapper" {
+		statuses = append(statuses, cd.CheckMetaSpace(cd.WarnMetaSpace, cd.CritMetaSpace))
+		statuses = append(statuses, cd.CheckDataSpace(cd.WarnDataSpace, cd.CritDataSpace))
+	}
+
+	if cd.ImageId != "" {
+		statuses = append(statuses, cd.CheckImageContainerStatus(cd.ImageId))
+		if cd.CheckRestartCount {
+	  	statuses = append(statuses, cd.CheckImageContainerRestartCount(cd.ImageId))
+		}
+		if cd.CheckUptime {
+			statuses = append(statuses, cd.CheckImageContainerUptime(cd.ImageId))
+		}
+	}
+
+	if cd.ContainerName != "" {
+		statuses = append(statuses, cd.CheckNamedContainerStatus(cd.ContainerName))
+		if cd.CheckRestartCount {
+	  	statuses = append(statuses, cd.CheckNamedContainerRestartCount(cd.ContainerName))
+		}
+		if cd.CheckUptime {
+			statuses = append(statuses, cd.CheckNamedContainerUptime(cd.ContainerName))
+		}
+	}
+
+  baseStatus.Aggregate(statuses)
+	nagios.ExitWithStatus(baseStatus)
 }
